@@ -18,9 +18,16 @@ require_cmd() {
 }
 
 check_environment() {
-  local required=(top free df ps awk grep sed date)
+  local required=(top df ps awk grep sed date)
   local ok=0
   local cmd
+
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    required+=(sysctl vm_stat)
+  else
+    required+=(free)
+  fi
+
   for cmd in "${required[@]}"; do
     if ! require_cmd "$cmd"; then
       ok=1
@@ -39,7 +46,12 @@ log_message() {
 
 get_cpu_usage() {
   local idle
-  idle=$(top -l 1 | awk '/CPU usage/ {gsub("%", "", $7); print $7}')
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    idle=$(top -l 1 | awk '/CPU usage/ {gsub("%", "", $7); print $7}')
+  else
+    # Linux: batch mode, one screen
+    idle=$(top -bn1 | awk '/%Cpu/ { gsub("%","",$8); print $8; exit }')
+  fi
   if [[ -z "$idle" ]]; then
     echo "0"
     return
@@ -47,7 +59,28 @@ get_cpu_usage() {
   awk -v idle="$idle" 'BEGIN { printf "%.0f", 100 - idle }'
 }
 
+# On Linux, `free -m` is the usual way to read Mem used/total. This machine is
+# macOS, which does not ship `free`, so we use vm_stat + sysctl instead.
 get_mem_usage() {
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    local page_size total_bytes
+    page_size=$(sysctl -n hw.pagesize)
+    total_bytes=$(sysctl -n hw.memsize)
+    vm_stat | awk -v ps="$page_size" -v tb="$total_bytes" '
+      function n() { gsub(/\./, "", $NF); return $NF + 0 }
+      /^Pages wired down/ { w = n() }
+      /^Pages active:/ { a = n() }
+      /^Pages inactive:/ { ina = n() }
+      /^Pages speculative:/ { s = n() }
+      /^Pages occupied by compressor/ { c = n() }
+      END {
+        if (tb <= 0) { print 0; exit }
+        used = (w + a + ina + s + c) * ps
+        printf "%.0f", (used / tb) * 100
+      }'
+    return
+  fi
+
   local used total
   used=$(free -m | awk '/Mem:/ {print $3}')
   total=$(free -m | awk '/Mem:/ {print $2}')
@@ -63,7 +96,8 @@ get_disk_usage() {
 }
 
 get_active_processes() {
-  ps -e --no-headers | wc -l | awk '{print $1}'
+  # BSD/macOS ps has no --no-headers; -axo pid= works on Linux and macOS.
+  ps -axo pid= 2>/dev/null | wc -l | tr -d ' '
 }
 
 show_health() {

@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -E '\\\\.\\(c|h|md|txt|Makefile\\)$')",
+      "Bash(done)"
+    ]
+  }
+}

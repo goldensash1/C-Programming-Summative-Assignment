@@ -1,320 +1,406 @@
 /*
-  Project 1: Smart Traffic Light Controller
-  - Two intersections
-  - Non-blocking control with millis()
-  - Vehicle detection via buttons
-  - Dynamic memory + structures + pointers
-  - Serial menu for monitoring and manual override
-*/
+ * Adaptive Traffic Signal Manager
+ * Controls dual junctions with vehicle sensing
+ * Uses millis() for non-blocking execution
+ *
+ * NOTE: Enum and structs must be declared before usage
+ */
 
-struct Intersection {
-  const char* name;
-  int redPin;
-  int yellowPin;
-  int greenPin;
-  int sensorPin;
+// ════════════════════════════════════════════════════════
+// PIN CONFIGURATION (LED pins for RGB traffic heads)
+// ════════════════════════════════════════════════════════
+#define RED1_PIN    2
+#define YELLOW1_PIN 3
+#define GREEN1_PIN  4
+#define BUTTON1_PIN 8
 
-  unsigned long greenDurationMs;
-  unsigned long yellowDurationMs;
-  unsigned long redDurationMs;
+#define RED2_PIN    5
+#define YELLOW2_PIN 6
+#define GREEN2_PIN  7
+#define BUTTON2_PIN 9
 
-  unsigned long lastStateChangeMs;
-  unsigned long vehicleCount;
-  bool lastSensorState;
-  int currentState; // 0 = RED, 1 = YELLOW, 2 = GREEN
-  bool manualMode;
+// ════════════════════════════════════════════════════════
+// TYPES
+// ════════════════════════════════════════════════════════
+enum SignalPhase {
+  PHASE_RED,
+  PHASE_YELLOW,
+  PHASE_GREEN
 };
 
-struct TrafficSystem {
-  Intersection* intersections;
-  int count;
-  bool autoMode;
-  unsigned long logIntervalMs;
-  unsigned long lastLogMs;
+struct Junction {
+  int junctionId;
+  int redLED;
+  int yellowLED;
+  int greenLED;
+  int sensorBtn;
+
+  SignalPhase activePhase;
+
+  unsigned long phaseStart;
+  unsigned long greenTime;
+  unsigned long yellowTime;
+  unsigned long redTime;
+
+  int carsCurrentCycle;
+  int carsTotal;
+
+  bool emergencyMode;
+  bool manualControl;
 };
 
-TrafficSystem* g_system = NULL;
+struct SystemMetrics {
+  int totalCars;
+  unsigned long bootTime;
+  int manualSwitches;
+  int emergencyTriggers;
+};
 
-const int STATE_RED = 0;
-const int STATE_YELLOW = 1;
-const int STATE_GREEN = 2;
+// ════════════════════════════════════════════════════════
+// GLOBALS
+// ════════════════════════════════════════════════════════
+Junction* junctionA = nullptr;
+Junction* junctionB = nullptr;
+SystemMetrics* metrics = nullptr;
 
-String stateToText(int state) {
-  if (state == STATE_RED) return "RED";
-  if (state == STATE_YELLOW) return "YELLOW";
-  if (state == STATE_GREEN) return "GREEN";
-  return "INVALID";
-}
+unsigned long lastUpdatePrint = 0;
+bool systemRunning = true;
 
-void setLights(Intersection* itx, int state) {
-  if (itx == NULL) return;
+// ════════════════════════════════════════════════════════
+// FUNCTION DECLARATIONS
+// ════════════════════════════════════════════════════════
+void initPins(Junction* j);
+void changePhase(Junction* j, SignalPhase next);
+void processJunction(Junction* j);
+void detectVehicle(Junction* j);
+void serialHandler();
 
-  if (state < STATE_RED || state > STATE_GREEN) {
-    Serial.print("[ERROR] Invalid state for ");
-    Serial.println(itx->name);
-    return;
-  }
+void showStatus();
+void showFullReport();
+void showMainMenu();
+void showManualHelp(int id);
+void displayPhase(SignalPhase p);
 
-  itx->currentState = state;
-  digitalWrite(itx->redPin, state == STATE_RED ? HIGH : LOW);
-  digitalWrite(itx->yellowPin, state == STATE_YELLOW ? HIGH : LOW);
-  digitalWrite(itx->greenPin, state == STATE_GREEN ? HIGH : LOW);
-  itx->lastStateChangeMs = millis();
-}
+void triggerEmergency();
+void rebootSystem();
 
-void configureIntersection(Intersection* itx, const char* name,
-                           int redPin, int yellowPin, int greenPin, int sensorPin) {
-  itx->name = name;
-  itx->redPin = redPin;
-  itx->yellowPin = yellowPin;
-  itx->greenPin = greenPin;
-  itx->sensorPin = sensorPin;
-
-  itx->greenDurationMs = 4000;
-  itx->yellowDurationMs = 1500;
-  itx->redDurationMs = 4000;
-
-  itx->lastStateChangeMs = 0;
-  itx->vehicleCount = 0;
-  itx->lastSensorState = false;
-  itx->manualMode = false;
-
-  pinMode(itx->redPin, OUTPUT);
-  pinMode(itx->yellowPin, OUTPUT);
-  pinMode(itx->greenPin, OUTPUT);
-  pinMode(itx->sensorPin, INPUT_PULLUP);
-
-  setLights(itx, STATE_RED);
-}
-
-void printHelp() {
-  Serial.println("\n=== Smart Traffic Controller Menu ===");
-  Serial.println("help                -> show commands");
-  Serial.println("status              -> print current state");
-  Serial.println("auto                -> enable automatic mode");
-  Serial.println("manual A RED        -> set intersection A state");
-  Serial.println("manual A YELLOW");
-  Serial.println("manual A GREEN");
-  Serial.println("manual B RED/YELLOW/GREEN");
-  Serial.println("reset               -> reset vehicle counters");
-  Serial.println("=====================================\n");
-}
-
-Intersection* getIntersectionByName(char nameChar) {
-  if (g_system == NULL || g_system->intersections == NULL) return NULL;
-  for (int i = 0; i < g_system->count; i++) {
-    if (g_system->intersections[i].name[0] == nameChar) {
-      return &g_system->intersections[i];
-    }
-  }
-  return NULL;
-}
-
-int parseState(const String& text) {
-  if (text == "RED") return STATE_RED;
-  if (text == "YELLOW") return STATE_YELLOW;
-  if (text == "GREEN") return STATE_GREEN;
-  return -1;
-}
-
-void printStatus() {
-  if (g_system == NULL) return;
-
-  Serial.println("\n--- Traffic Status ---");
-  Serial.print("Mode: ");
-  Serial.println(g_system->autoMode ? "AUTO" : "MANUAL");
-
-  for (int i = 0; i < g_system->count; i++) {
-    Intersection* itx = &g_system->intersections[i];
-    Serial.print("Intersection ");
-    Serial.print(itx->name);
-    Serial.print(" | State: ");
-    Serial.print(stateToText(itx->currentState));
-    Serial.print(" | Vehicles: ");
-    Serial.print(itx->vehicleCount);
-    Serial.print(" | Green(ms): ");
-    Serial.println(itx->greenDurationMs);
-  }
-}
-
-void handleSerialCommand(String cmdLine) {
-  cmdLine.trim();
-  cmdLine.toUpperCase();
-
-  if (cmdLine.length() == 0) return;
-
-  if (cmdLine == "HELP") {
-    printHelp();
-    return;
-  }
-
-  if (cmdLine == "STATUS") {
-    printStatus();
-    return;
-  }
-
-  if (cmdLine == "AUTO") {
-    g_system->autoMode = true;
-    for (int i = 0; i < g_system->count; i++) {
-      g_system->intersections[i].manualMode = false;
-    }
-    Serial.println("[OK] Automatic mode enabled");
-    return;
-  }
-
-  if (cmdLine == "RESET") {
-    for (int i = 0; i < g_system->count; i++) {
-      g_system->intersections[i].vehicleCount = 0;
-    }
-    Serial.println("[OK] Vehicle counters reset");
-    return;
-  }
-
-  if (cmdLine.startsWith("MANUAL ")) {
-    int firstSpace = cmdLine.indexOf(' ');
-    int secondSpace = cmdLine.indexOf(' ', firstSpace + 1);
-    if (secondSpace < 0) {
-      Serial.println("[ERROR] Use format: MANUAL A RED");
-      return;
-    }
-
-    String namePart = cmdLine.substring(firstSpace + 1, secondSpace);
-    String statePart = cmdLine.substring(secondSpace + 1);
-
-    if (namePart.length() != 1) {
-      Serial.println("[ERROR] Intersection must be A or B");
-      return;
-    }
-
-    Intersection* itx = getIntersectionByName(namePart[0]);
-    if (itx == NULL) {
-      Serial.println("[ERROR] Unknown intersection");
-      return;
-    }
-
-    int state = parseState(statePart);
-    if (state < 0) {
-      Serial.println("[ERROR] State must be RED, YELLOW, or GREEN");
-      return;
-    }
-
-    g_system->autoMode = false;
-    itx->manualMode = true;
-    setLights(itx, state);
-    Serial.print("[OK] ");
-    Serial.print(itx->name);
-    Serial.print(" set to ");
-    Serial.println(stateToText(state));
-    return;
-  }
-
-  Serial.println("[ERROR] Unknown command. Type HELP");
-}
-
-void updateVehicleDetection(Intersection* itx) {
-  bool pressed = (digitalRead(itx->sensorPin) == LOW);
-  if (pressed && !itx->lastSensorState) {
-    itx->vehicleCount++;
-  }
-  itx->lastSensorState = pressed;
-}
-
-void adjustTimings(Intersection* itx) {
-  // Increase green duration if many vehicles detected recently.
-  if (itx->vehicleCount > 10) {
-    itx->greenDurationMs = 7000;
-  } else if (itx->vehicleCount > 5) {
-    itx->greenDurationMs = 5500;
-  } else {
-    itx->greenDurationMs = 4000;
-  }
-  itx->redDurationMs = itx->greenDurationMs;
-}
-
-void updateIntersectionAuto(Intersection* itx) {
-  if (itx->manualMode) return;
-
-  adjustTimings(itx);
-
-  unsigned long now = millis();
-  unsigned long elapsed = now - itx->lastStateChangeMs;
-
-  if (itx->currentState == STATE_GREEN && elapsed >= itx->greenDurationMs) {
-    setLights(itx, STATE_YELLOW);
-  } else if (itx->currentState == STATE_YELLOW && elapsed >= itx->yellowDurationMs) {
-    setLights(itx, STATE_RED);
-  } else if (itx->currentState == STATE_RED && elapsed >= itx->redDurationMs) {
-    setLights(itx, STATE_GREEN);
-  }
-}
-
-void setupSystem() {
-  g_system = (TrafficSystem*)malloc(sizeof(TrafficSystem));
-  if (g_system == NULL) {
-    Serial.println("[FATAL] Failed to allocate traffic system");
-    while (true) {}
-  }
-
-  g_system->count = 2;
-  g_system->intersections = (Intersection*)malloc(sizeof(Intersection) * g_system->count);
-  if (g_system->intersections == NULL) {
-    Serial.println("[FATAL] Failed to allocate intersections");
-    while (true) {}
-  }
-
-  g_system->autoMode = true;
-  g_system->logIntervalMs = 2000;
-  g_system->lastLogMs = 0;
-
-  configureIntersection(&g_system->intersections[0], "A", 2, 3, 4, 8);
-  configureIntersection(&g_system->intersections[1], "B", 5, 6, 7, 9);
-
-  setLights(&g_system->intersections[0], STATE_GREEN);
-  setLights(&g_system->intersections[1], STATE_RED);
-}
-
+// ════════════════════════════════════════════════════════
 void setup() {
   Serial.begin(9600);
-  while (!Serial) {}
+  Serial.println("Booting Traffic Signal Manager...");
 
-  setupSystem();
-  printHelp();
+  junctionA = new Junction;
+  junctionB = new Junction;
+  metrics   = new SystemMetrics;
+
+  // Junction A
+  junctionA->junctionId = 1;
+  junctionA->redLED     = RED1_PIN;
+  junctionA->yellowLED  = YELLOW1_PIN;
+  junctionA->greenLED   = GREEN1_PIN;
+  junctionA->sensorBtn  = BUTTON1_PIN;
+
+  junctionA->activePhase = PHASE_GREEN;
+  junctionA->phaseStart  = millis();
+
+  junctionA->greenTime  = 10000;
+  junctionA->yellowTime = 2000;
+  junctionA->redTime    = 10000;
+
+  junctionA->carsCurrentCycle = 0;
+  junctionA->carsTotal        = 0;
+  junctionA->emergencyMode    = false;
+  junctionA->manualControl    = false;
+
+  // Junction B
+  junctionB->junctionId = 2;
+  junctionB->redLED     = RED2_PIN;
+  junctionB->yellowLED  = YELLOW2_PIN;
+  junctionB->greenLED   = GREEN2_PIN;
+  junctionB->sensorBtn  = BUTTON2_PIN;
+
+  junctionB->activePhase = PHASE_RED;
+  junctionB->phaseStart  = millis();
+
+  junctionB->greenTime  = 10000;
+  junctionB->yellowTime = 2000;
+  junctionB->redTime    = 10000;
+
+  junctionB->carsCurrentCycle = 0;
+  junctionB->carsTotal        = 0;
+  junctionB->emergencyMode    = false;
+  junctionB->manualControl    = false;
+
+  // Metrics
+  metrics->totalCars        = 0;
+  metrics->bootTime         = millis();
+  metrics->manualSwitches   = 0;
+  metrics->emergencyTriggers = 0;
+
+  initPins(junctionA);
+  initPins(junctionB);
+
+  changePhase(junctionA, PHASE_GREEN);
+  changePhase(junctionB, PHASE_RED);
+
+  Serial.println("System initialized successfully.");
+  showMainMenu();
 }
 
+// ════════════════════════════════════════════════════════
 void loop() {
-  if (g_system == NULL) return;
+  if (systemRunning) {
+    processJunction(junctionA);
+    processJunction(junctionB);
 
-  for (int i = 0; i < g_system->count; i++) {
-    updateVehicleDetection(&g_system->intersections[i]);
-  }
+    detectVehicle(junctionA);
+    detectVehicle(junctionB);
 
-  if (g_system->autoMode) {
-    updateIntersectionAuto(&g_system->intersections[0]);
-
-    // Keep B opposite to A for safety in this simple model.
-    if (g_system->intersections[0].currentState == STATE_GREEN) {
-      if (g_system->intersections[1].currentState != STATE_RED) {
-        setLights(&g_system->intersections[1], STATE_RED);
-      }
-    } else if (g_system->intersections[0].currentState == STATE_RED) {
-      if (g_system->intersections[1].currentState != STATE_GREEN) {
-        setLights(&g_system->intersections[1], STATE_GREEN);
-      }
-    } else {
-      if (g_system->intersections[1].currentState != STATE_RED) {
-        setLights(&g_system->intersections[1], STATE_RED);
-      }
+    if (millis() - lastUpdatePrint >= 2000) {
+      showStatus();
+      lastUpdatePrint = millis();
     }
   }
 
-  unsigned long now = millis();
-  if (now - g_system->lastLogMs >= g_system->logIntervalMs) {
-    g_system->lastLogMs = now;
-    printStatus();
+  serialHandler();
+}
+
+// ════════════════════════════════════════════════════════
+void initPins(Junction* j) {
+  pinMode(j->redLED, OUTPUT);
+  pinMode(j->yellowLED, OUTPUT);
+  pinMode(j->greenLED, OUTPUT);
+  pinMode(j->sensorBtn, INPUT_PULLUP);
+}
+
+// ════════════════════════════════════════════════════════
+void changePhase(Junction* j, SignalPhase next) {
+  digitalWrite(j->redLED, LOW);
+  digitalWrite(j->yellowLED, LOW);
+  digitalWrite(j->greenLED, LOW);
+
+  // RED: only red on, GREEN: only green on
+  if (next == PHASE_RED) {
+    digitalWrite(j->redLED, HIGH);
+  }
+  else if (next == PHASE_GREEN) {
+    digitalWrite(j->greenLED, HIGH);
+  }
+  // YELLOW: mix red + green on RGB LED
+  else if (next == PHASE_YELLOW) {
+    digitalWrite(j->redLED, HIGH);
+    digitalWrite(j->greenLED, HIGH);
   }
 
-  if (Serial.available() > 0) {
-    String cmd = Serial.readStringUntil('\n');
-    handleSerialCommand(cmd);
+  j->activePhase = next;
+  j->phaseStart  = millis();
+}
+
+// ════════════════════════════════════════════════════════
+void processJunction(Junction* j) {
+  if (j->manualControl) return;
+
+  unsigned long duration = millis() - j->phaseStart;
+
+  if (j->activePhase == PHASE_GREEN && duration >= j->greenTime) {
+    changePhase(j, PHASE_YELLOW);
   }
+  else if (j->activePhase == PHASE_YELLOW && duration >= j->yellowTime) {
+    changePhase(j, PHASE_RED);
+  }
+  else if (j->activePhase == PHASE_RED && duration >= j->redTime) {
+    j->carsCurrentCycle = 0;
+    changePhase(j, PHASE_GREEN);
+  }
+}
+
+// ════════════════════════════════════════════════════════
+void detectVehicle(Junction* j) {
+  if (digitalRead(j->sensorBtn) == LOW) {
+
+    if (j->activePhase == PHASE_GREEN) {
+      j->carsCurrentCycle++;
+      j->carsTotal++;
+      metrics->totalCars++;
+
+      Serial.print("Car sensed @ Junction ");
+      Serial.print(j->junctionId);
+      Serial.print(" | Cycle Count: ");
+      Serial.print(j->carsCurrentCycle);
+      Serial.print(" | Lifetime: ");
+      Serial.println(j->carsTotal);
+
+      // adaptive timing
+      if (j->carsCurrentCycle > 8) {
+        j->greenTime = 15000;
+      } else if (j->carsCurrentCycle > 3) {
+        j->greenTime = 12000;
+      } else {
+        j->greenTime = 10000;
+      }
+
+      delay(50);
+    }
+  }
+}
+
+// ════════════════════════════════════════════════════════
+void serialHandler() {
+  if (!Serial.available()) return;
+
+  char cmd = Serial.read();
+  while (Serial.available()) Serial.read();
+
+  switch (cmd) {
+
+    case '1':
+      junctionA->manualControl = !junctionA->manualControl;
+      metrics->manualSwitches++;
+      Serial.println(junctionA->manualControl ? "Junction 1 manual ON" : "Junction 1 manual OFF");
+      if (junctionA->manualControl) showManualHelp(1);
+      break;
+
+    case '2':
+      junctionB->manualControl = !junctionB->manualControl;
+      metrics->manualSwitches++;
+      Serial.println(junctionB->manualControl ? "Junction 2 manual ON" : "Junction 2 manual OFF");
+      if (junctionB->manualControl) showManualHelp(2);
+      break;
+
+    case 'R': case 'r':
+      if (junctionA->manualControl) { changePhase(junctionA, PHASE_RED); Serial.println("J1 -> RED"); }
+      if (junctionB->manualControl) { changePhase(junctionB, PHASE_RED); Serial.println("J2 -> RED"); }
+      break;
+
+    case 'G': case 'g':
+      if (junctionA->manualControl) { changePhase(junctionA, PHASE_GREEN); Serial.println("J1 -> GREEN"); }
+      if (junctionB->manualControl) { changePhase(junctionB, PHASE_GREEN); Serial.println("J2 -> GREEN"); }
+      break;
+
+    case 'Y': case 'y':
+      if (junctionA->manualControl) { changePhase(junctionA, PHASE_YELLOW); Serial.println("J1 -> YELLOW"); }
+      if (junctionB->manualControl) { changePhase(junctionB, PHASE_YELLOW); Serial.println("J2 -> YELLOW"); }
+      break;
+
+    case 'E': case 'e':
+      triggerEmergency();
+      break;
+
+    case 'S': case 's':
+      rebootSystem();
+      break;
+
+    case 'M': case 'm':
+      showMainMenu();
+      break;
+
+    case 'V': case 'v':
+      showFullReport();
+      break;
+
+    default:
+      Serial.println("Unknown input. Press M for help.");
+  }
+}
+
+// ════════════════════════════════════════════════════════
+void showMainMenu() {
+  Serial.println("\n=== CONTROL PANEL ===");
+  Serial.println("1 -> Manual Mode J1");
+  Serial.println("2 -> Manual Mode J2");
+  Serial.println("R/G/Y -> Change Light");
+  Serial.println("E -> Emergency Stop");
+  Serial.println("S -> Restart System");
+  Serial.println("V -> Statistics");
+  Serial.println("M -> Menu");
+}
+
+// ════════════════════════════════════════════════════════
+void showManualHelp(int id) {
+  Serial.print("Manual Control Enabled for Junction ");
+  Serial.println(id);
+  Serial.println("Use: R / G / Y");
+}
+
+// ════════════════════════════════════════════════════════
+void showStatus() {
+  Serial.println("\n--- LIVE STATUS ---");
+
+  Serial.print("J1: ");
+  displayPhase(junctionA->activePhase);
+  Serial.print(" | Cars: ");
+  Serial.print(junctionA->carsCurrentCycle);
+
+  Serial.print("   J2: ");
+  displayPhase(junctionB->activePhase);
+  Serial.print(" | Cars: ");
+  Serial.print(junctionB->carsCurrentCycle);
+
+  Serial.print("   Total: ");
+  Serial.println(metrics->totalCars);
+}
+
+// ════════════════════════════════════════════════════════
+void showFullReport() {
+  Serial.println("\n--- SYSTEM REPORT ---");
+
+  unsigned long up = (millis() - metrics->bootTime) / 1000;
+
+  Serial.print("Uptime: ");
+  Serial.print(up / 60);
+  Serial.print("m ");
+  Serial.print(up % 60);
+  Serial.println("s");
+
+  Serial.print("Total Cars: ");
+  Serial.println(metrics->totalCars);
+
+  Serial.print("Manual Toggles: ");
+  Serial.println(metrics->manualSwitches);
+
+  Serial.print("Emergency Events: ");
+  Serial.println(metrics->emergencyTriggers);
+}
+
+// ════════════════════════════════════════════════════════
+void displayPhase(SignalPhase p) {
+  if (p == PHASE_RED) Serial.print("RED");
+  else if (p == PHASE_YELLOW) Serial.print("YEL");
+  else Serial.print("GRN");
+}
+
+// ════════════════════════════════════════════════════════
+void triggerEmergency() {
+  Serial.println("\n!!! EMERGENCY MODE !!!");
+
+  metrics->emergencyTriggers++;
+
+  changePhase(junctionA, PHASE_RED);
+  changePhase(junctionB, PHASE_RED);
+
+  systemRunning = false;
+
+  Serial.println("System halted. Reset with S.");
+}
+
+// ════════════════════════════════════════════════════════
+void rebootSystem() {
+  Serial.println("\nReinitializing system...");
+
+  systemRunning = true;
+
+  junctionA->carsCurrentCycle = 0;
+  junctionA->manualControl = false;
+
+  junctionB->carsCurrentCycle = 0;
+  junctionB->manualControl = false;
+
+  metrics->totalCars = 0;
+  metrics->bootTime  = millis();
+
+  changePhase(junctionA, PHASE_GREEN);
+  changePhase(junctionB, PHASE_RED);
+
+  Serial.println("System back online.");
+  showMainMenu();
 }
